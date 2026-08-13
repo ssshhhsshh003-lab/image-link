@@ -106,6 +106,7 @@ app.post('/api-create-link', upload.single('image'), async (req, res) => {
 
     return res.status(201).json(createdLink);
   } catch (err: any) {
+    console.error('API /api-create-link error:', err);
     return res.status(400).json({ error: err.message || 'Unable to create image link.' });
   }
 });
@@ -313,7 +314,6 @@ app.get('/', (req, res) => {
           const res = await fetch('/api-user-links?id=' + id, { method: 'DELETE' });
           if (res.ok) loadLinks();
         }
-        
 
         function copyLink(slug) {
           navigator.clipboard.writeText(location.origin + '/i/' + slug);
