@@ -21,7 +21,7 @@ export async function ensureUsersTableSchema(): Promise<void> {
     );
   `);
 
-  // Migrate old schema if email exists without username/password_hash
+  // Migrate old schema if email column exists with NOT NULL constraint
   await query(`
     DO $$
     BEGIN
@@ -30,6 +30,9 @@ export async function ensureUsersTableSchema(): Promise<void> {
       END IF;
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='password_hash') THEN
         ALTER TABLE users ADD COLUMN password_hash VARCHAR(255);
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='email') THEN
+        ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
       END IF;
     END $$;
   `);
