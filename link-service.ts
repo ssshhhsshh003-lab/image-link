@@ -88,8 +88,9 @@ export async function createImageLink(input: CreateImageLinkInput): Promise<Imag
   let imageUrl: string;
   try {
     imageUrl = await uploadImageToStorage(imageBuffer, imageFileName, mimeType);
-  } catch (err) {
-    throw new Error('STORAGE_ERROR');
+  } catch (err: any) {
+    console.error('createImageLink Blob storage upload failed:', err);
+    throw new Error(`STORAGE_ERROR: ${err?.message || 'Vercel Blob upload failed'}`);
   }
 
   // 2. Generate slug & save in DB with cleanup fallback
