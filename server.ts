@@ -188,7 +188,8 @@ app.post('/api-login', async (req, res) => {
 
     return res.status(200).json({ success: true });
   } catch (err: any) {
-    return res.status(500).json({ error: 'Authentication failed.' });
+    console.error('[LOGIN ERROR]', err);
+    return res.status(500).json({ error: err?.message || 'Authentication failed due to database or server error.' });
   }
 });
 
@@ -438,7 +439,6 @@ app.get('/', requireAuth, (req, res) => {
           const res = await fetch('/api-user-links?id=' + id, { method: 'DELETE' });
           if (res.ok) loadLinks();
         }
-      
 
         function copyLink(slug) {
           navigator.clipboard.writeText(location.origin + '/i/' + slug);
