@@ -1,20 +1,41 @@
 import express from 'express';
 import multer from 'multer';
+import cookieParser from 'cookie-parser';
 import { createImageLink, getImageLinkBySlug, getUserImageLinks, deleteImageLink, updateImageLink, getCountryStatsForLink, getImageLinkById, incrementTotalClicks, incrementCountryClicks } from './link-service';
 import { isSocialCrawler } from './crawler-detector';
 import { detectCountryFromRequest } from './country-resolver';
+import { authenticateUser, generateSessionToken, verifySessionToken, ensureUsersTableSchema } from './auth';
 
 const app = express();
 const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB limit
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
-function getSessionUserId(req: express.Request): string {
-  return (req.headers['x-user-id'] as string) || 'default_user_1';
+// Initialize users table schema and admin user asynchronously on startup
+ensureUsersTableSchema().catch(err => console.error('[AUTH SCHEMA ERROR]', err));
+
+function getAuthenticatedUserId(req: express.Request): string | null {
+  const token = req.cookies?.auth_token;
+  if (!token) return null;
+  const session = verifySessionToken(token);
+  return session ? session.userId : null;
 }
 
-// 1. PUBLIC ROUTE: Dynamic Link Lookup, Social Crawler Detection & Fast Redirect
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const userId = getAuthenticatedUserId(req);
+  if (!userId) {
+    if (req.path.startsWith('/api-')) {
+      return res.status(401).json({ error: 'UNAUTHORIZED: Please log in.' });
+    }
+    return res.redirect('/login');
+  }
+  (req as any).userId = userId;
+  next();
+}
+
+// 1. PUBLIC ROUTE: Dynamic Link Lookup, Social Crawler Detection & Fast Redirect (NO AUTH REQUIRED)
 app.get('/i/:slug', async (req, res) => {
   const { slug } = req.params;
   const link = await getImageLinkBySlug(slug);
@@ -82,8 +103,102 @@ app.get('/i/:slug', async (req, res) => {
   return res.redirect(302, link.destinationUrl);
 });
 
-// 2. API ENDPOINTS
-app.post('/api-create-link', upload.single('image'), async (req, res) => {
+// 2. AUTHENTICATION ROUTES (LOGIN / LOGOUT)
+app.get('/login', (req, res) => {
+  if (getAuthenticatedUserId(req)) {
+    return res.redirect('/');
+  }
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Login - Simple Image Links</title>
+      <script src="https://cdn.tailwindcss.com"></script>
+    </head>
+    <body class="bg-slate-50 text-slate-900 min-h-screen flex items-center justify-center p-4 font-sans">
+      <div class="border rounded-xl p-8 bg-white shadow-sm max-w-sm w-full space-y-6">
+        <div class="text-center">
+          <h1 class="text-2xl font-bold">Admin Login</h1>
+          <p class="text-xs text-slate-500 mt-1">Sign in to manage your image links</p>
+        </div>
+        <form id="loginForm" onsubmit="submitLogin(event)" class="space-y-4">
+          <div id="errorAlert" class="hidden text-xs bg-red-50 text-red-600 border border-red-200 p-2.5 rounded-md font-medium"></div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Username</label>
+            <input type="text" id="username" required class="w-full px-3 py-2 border rounded-md text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="admin" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Password</label>
+            <input type="password" id="password" required class="w-full px-3 py-2 border rounded-md text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="••••••••" />
+          </div>
+          <button type="submit" class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm rounded-md transition-colors">Sign In</button>
+        </form>
+      </div>
+
+      <script>
+        async function submitLogin(e) {
+          e.preventDefault();
+          const errDiv = document.getElementById('errorAlert');
+          errDiv.classList.add('hidden');
+
+          const username = document.getElementById('username').value;
+          const password = document.getElementById('password').value;
+
+          const res = await fetch('/api-login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+          });
+
+          if (res.ok) {
+            window.location.href = '/';
+          } else {
+            const data = await res.json();
+            errDiv.textContent = data.error || 'Invalid credentials';
+            errDiv.classList.remove('hidden');
+          }
+        }
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+app.post('/api-login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required.' });
+    }
+
+    const user = await authenticateUser(username, password);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid username or password.' });
+    }
+
+    const token = generateSessionToken(user.id);
+    res.cookie('auth_token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    });
+
+    return res.status(200).json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: 'Authentication failed.' });
+  }
+});
+
+app.post('/api-logout', (req, res) => {
+  res.clearCookie('auth_token');
+  return res.status(200).json({ success: true });
+});
+
+// 3. PROTECTED API ENDPOINTS (REQUIRE AUTHENTICATION)
+app.post('/api-create-link', requireAuth, upload.single('image'), async (req, res) => {
   try {
     const { title, description, destinationUrl } = req.body;
     if (!destinationUrl) {
@@ -93,7 +208,7 @@ app.post('/api-create-link', upload.single('image'), async (req, res) => {
       return res.status(400).json({ error: 'Please select an image.' });
     }
 
-    const userId = getSessionUserId(req);
+    const userId = (req as any).userId;
     const createdLink = await createImageLink({
       userId,
       imageBuffer: req.file.buffer,
@@ -111,9 +226,9 @@ app.post('/api-create-link', upload.single('image'), async (req, res) => {
   }
 });
 
-app.get('/api-user-links', async (req, res) => {
+app.get('/api-user-links', requireAuth, async (req, res) => {
   try {
-    const userId = getSessionUserId(req);
+    const userId = (req as any).userId;
     const links = await getUserImageLinks(userId);
     return res.status(200).json(links);
   } catch (err) {
@@ -121,13 +236,13 @@ app.get('/api-user-links', async (req, res) => {
   }
 });
 
-app.delete('/api-user-links', async (req, res) => {
+app.delete('/api-user-links', requireAuth, async (req, res) => {
   try {
     const { id } = req.query;
     if (!id || typeof id !== 'string') {
       return res.status(400).json({ error: 'Missing link ID.' });
     }
-    const userId = getSessionUserId(req);
+    const userId = (req as any).userId;
     await deleteImageLink(id, userId);
     return res.status(200).json({ success: true });
   } catch (err: any) {
@@ -135,13 +250,13 @@ app.delete('/api-user-links', async (req, res) => {
   }
 });
 
-app.post('/api-update-link', upload.single('image'), async (req, res) => {
+app.post('/api-update-link', requireAuth, upload.single('image'), async (req, res) => {
   try {
     const { linkId, title, description, destinationUrl } = req.body;
     if (!linkId) {
       return res.status(400).json({ error: 'Missing link ID.' });
     }
-    const userId = getSessionUserId(req);
+    const userId = (req as any).userId;
 
     const updated = await updateImageLink(linkId, userId, {
       title: title || undefined,
@@ -158,13 +273,13 @@ app.post('/api-update-link', upload.single('image'), async (req, res) => {
   }
 });
 
-app.get('/api-analytics', async (req, res) => {
+app.get('/api-analytics', requireAuth, async (req, res) => {
   try {
     const { linkId } = req.query;
     if (!linkId || typeof linkId !== 'string') {
       return res.status(400).json({ error: 'Missing link ID.' });
     }
-    const userId = getSessionUserId(req);
+    const userId = (req as any).userId;
     const link = await getImageLinkById(linkId, userId);
     if (!link) {
       return res.status(403).json({ error: 'UNAUTHORIZED' });
@@ -185,8 +300,8 @@ app.get('/api-analytics', async (req, res) => {
   }
 });
 
-// 3. DASHBOARD HTML INTERFACE (Single Root File UI)
-app.get('/', (req, res) => {
+// 4. PROTECTED DASHBOARD HTML ROUTE (REQUIRE AUTHENTICATION)
+app.get('/', requireAuth, (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
@@ -197,10 +312,13 @@ app.get('/', (req, res) => {
       <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-50 text-slate-900 min-h-screen p-4 sm:p-6 font-sans">
-      <div className="max-w-4xl mx-auto" id="app">
+      <div class="max-w-4xl mx-auto" id="app">
         <header class="flex items-center justify-between border-b pb-4 mb-6">
           <h1 class="text-2xl font-bold">Simple Image Links</h1>
-          <button onclick="showCreate()" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm rounded-md">+ Create Link</button>
+          <div class="flex items-center gap-3">
+            <button onclick="showCreate()" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm rounded-md">+ Create Link</button>
+            <button onclick="logout()" class="px-3 py-1.5 border hover:bg-slate-100 text-slate-700 font-semibold text-sm rounded-md">Logout</button>
+          </div>
         </header>
 
         <main id="content" class="space-y-6">
@@ -209,8 +327,14 @@ app.get('/', (req, res) => {
       </div>
 
       <script>
+        async function logout() {
+          await fetch('/api-logout', { method: 'POST' });
+          window.location.href = '/login';
+        }
+
         async function loadLinks() {
           const res = await fetch('/api-user-links');
+          if (res.status === 401) { window.location.href = '/login'; return; }
           const links = await res.json();
           const content = document.getElementById('content');
           if (!links.length) {
@@ -333,3 +457,4 @@ app.listen(PORT, () => {
 });
 
 export default app;
+
