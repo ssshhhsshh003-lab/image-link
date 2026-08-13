@@ -313,6 +313,7 @@ app.get('/', (req, res) => {
           const res = await fetch('/api-user-links?id=' + id, { method: 'DELETE' });
           if (res.ok) loadLinks();
         }
+        
 
         function copyLink(slug) {
           navigator.clipboard.writeText(location.origin + '/i/' + slug);
