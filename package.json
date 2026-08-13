@@ -2,7 +2,6 @@
   "name": "simple-image-links",
   "version": "0.1.0",
   "private": true,
-  "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
     "build": "tsc",
