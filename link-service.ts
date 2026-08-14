@@ -239,6 +239,52 @@ export async function incrementCountryClicks(
   );
 }
 
+// Single atomic transaction: increment total_clicks AND country_stats together
+// This is the ONLY correct way to maintain SUM(country_stats) == total_clicks
+export async function recordSuccessfulClick(
+  linkId: string,
+  countryCode: string,
+  countryName: string
+): Promise<void> {
+  // Always normalize: never allow a click with no country entry
+  const code = ((countryCode || '').toUpperCase() || 'XX');
+  const name = countryName || 'Unknown';
+  const statId = randomUUID();
+
+  const pool = getDbPool();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Increment total_clicks
+    await client.query(
+      `UPDATE image_links SET total_clicks = total_clicks + 1, updated_at = NOW() WHERE id = $1`,
+      [linkId]
+    );
+
+    // 2. Upsert country stat — always happens, no exception can skip it
+    await client.query(
+      `INSERT INTO country_stats (id, image_link_id, country_code, country_name, clicks, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 1, NOW(), NOW())
+       ON CONFLICT (image_link_id, country_code)
+       DO UPDATE SET
+         clicks = country_stats.clicks + 1,
+         country_name = EXCLUDED.country_name,
+         updated_at = NOW()`,
+      [statId, linkId, code, name]
+    );
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('recordSuccessfulClick transaction error:', err);
+    // Re-throw so caller knows recording failed (redirect still happened)
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 // Atomic Check & Increment per-IP Redirect Limit using a PostgreSQL Transaction with FOR UPDATE lock
 export async function checkAndIncrementIpRedirectLimit(
   linkId: string,
