@@ -11,6 +11,7 @@ import {
   getImageLinkById,
   incrementTotalClicks,
   incrementCountryClicks,
+  recordSuccessfulClick,
   hashIpAddress,
   checkAndIncrementIpRedirectLimit
 } from './link-service';
@@ -147,19 +148,23 @@ app.get('/i/:slug', async (req, res) => {
     `);
   }
 
-  // Normal Human Visitor: Increment analytics asynchronously & Fast Server Redirect
-  try {
-    const country = await detectCountryFromRequest(req);
-    Promise.all([
-      incrementTotalClicks(link.id),
-      incrementCountryClicks(link.id, country.code, country.name)
-    ]).catch(err => console.error('Analytics update error:', err));
-  } catch (err) {
-    console.error('Country detection error:', err);
-  }
-
+  // Normal Human Visitor: Fire analytics async (redirect immediately, never wait for DB)
+  // Country detection + DB write happen in background
+  // recordSuccessfulClick atomically updates total_clicks AND country_stats in one transaction
+  // so SUM(country_stats.clicks) always equals total_clicks
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  return res.redirect(302, link.destinationUrl);
+  res.redirect(302, link.destinationUrl);
+
+  // Analytics fire AFTER response is sent — never blocks visitor
+  detectCountryFromRequest(req)
+    .then(country => recordSuccessfulClick(link.id, country.code, country.name))
+    .catch(err => {
+      // Even if country detection throws, still record click as Unknown
+      console.error('Country detection failed, recording as Unknown:', err);
+      recordSuccessfulClick(link.id, 'XX', 'Unknown').catch(e =>
+        console.error('recordSuccessfulClick fallback error:', e)
+      );
+    });
 });
 
 // 2. AUTHENTICATION ROUTES (LOGIN / LOGOUT)
