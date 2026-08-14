@@ -1,6 +1,7 @@
 const SOCIAL_CRAWLER_USER_AGENTS = [
   'facebookexternalhit',
   'facebookcatalog',
+  'facebot',
   'twitterbot',
   'linkedinbot',
   'whatsapp',
@@ -18,3 +19,4 @@ export function isSocialCrawler(userAgent?: string | null): boolean {
   const lower = userAgent.toLowerCase();
   return SOCIAL_CRAWLER_USER_AGENTS.some((crawler) => lower.includes(crawler));
 }
+
