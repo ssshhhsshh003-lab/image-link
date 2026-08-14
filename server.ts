@@ -60,32 +60,36 @@ app.get('/i/:slug', async (req, res) => {
 
   // Check for Social Crawlers (Facebook, Twitter, WhatsApp, etc.)
   if (isSocialCrawler(userAgent)) {
-    const title = link.title || 'Simple Image Link';
-    const description = link.description || 'Shared via Simple Image Links.';
+    const title = (link.title || 'Simple Image Link')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+    const description = (link.description || 'Shared via Simple Image Links.')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
     const imageUrl = link.imageUrl;
 
-    return res.status(200).send(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <title>${title}</title>
-          <meta name="description" content="${description}" />
-          <meta property="og:type" content="website" />
-          <meta property="og:title" content="${title}" />
-          <meta property="og:description" content="${description}" />
-          <meta property="og:image" content="${imageUrl}" />
-          <meta property="og:url" content="${publicUrl}" />
-          <meta name="twitter:card" content="summary_large_image" />
-          <meta name="twitter:title" content="${title}" />
-          <meta name="twitter:description" content="${description}" />
-          <meta name="twitter:image" content="${imageUrl}" />
-        </head>
-        <body>
-          <h2>${title}</h2>
-          <p>${description}</p>
-        </body>
-      </html>
-    `);
+    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300, stale-while-revalidate=600');
+    return res.status(200).send(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${description}">
+<meta property="og:image" content="${imageUrl}">
+<meta property="og:url" content="${publicUrl}">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${title}">
+<meta name="twitter:description" content="${description}">
+<meta name="twitter:image" content="${imageUrl}">
+<title>${title}</title>
+</head>
+<body></body>
+</html>`);
   }
 
   // Normal Human Visitor: Increment analytics asynchronously & Fast Server Redirect
