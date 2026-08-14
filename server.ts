@@ -1,7 +1,19 @@
 import express from 'express';
 import multer from 'multer';
 import cookieParser from 'cookie-parser';
-import { createImageLink, getImageLinkBySlug, getUserImageLinks, deleteImageLink, updateImageLink, getCountryStatsForLink, getImageLinkById, incrementTotalClicks, incrementCountryClicks } from './link-service';
+import {
+  createImageLink,
+  getImageLinkBySlug,
+  getUserImageLinks,
+  deleteImageLink,
+  updateImageLink,
+  getCountryStatsForLink,
+  getImageLinkById,
+  incrementTotalClicks,
+  incrementCountryClicks,
+  hashIpAddress,
+  checkAndIncrementIpRedirectLimit
+} from './link-service';
 import { isSocialCrawler } from './crawler-detector';
 import { detectCountryFromRequest } from './country-resolver';
 import { authenticateUser, generateSessionToken, verifySessionToken, ensureUsersTableSchema } from './auth';
@@ -12,6 +24,9 @@ const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB limit
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
+
+// Trust proxy headers on Vercel / reverse proxies
+app.set('trust proxy', true);
 
 // Initialize users table schema and admin user asynchronously on startup
 ensureUsersTableSchema().catch(err => console.error('[AUTH SCHEMA ERROR]', err));
@@ -33,6 +48,22 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
   }
   (req as any).userId = userId;
   next();
+}
+
+// Safely extract client IP from request headers in proxy environments
+function getClientIp(req: express.Request): string {
+  const xForwardedFor = req.headers['x-forwarded-for'];
+  if (xForwardedFor) {
+    const raw = Array.isArray(xForwardedFor) ? xForwardedFor[0] : xForwardedFor;
+    const clientIp = raw.split(',')[0].trim();
+    if (clientIp) return clientIp;
+  }
+  const xRealIp = req.headers['x-real-ip'];
+  if (xRealIp) {
+    const raw = Array.isArray(xRealIp) ? xRealIp[0] : xRealIp;
+    if (raw.trim()) return raw.trim();
+  }
+  return req.ip || req.socket.remoteAddress || '127.0.0.1';
 }
 
 // 1. PUBLIC ROUTE: Dynamic Link Lookup, Social Crawler Detection & Fast Redirect (NO AUTH REQUIRED)
@@ -90,6 +121,30 @@ app.get('/i/:slug', async (req, res) => {
 </head>
 <body></body>
 </html>`);
+  }
+
+  // Normal Human Visitor: Check Per-IP Redirect Limit
+  const clientIp = getClientIp(req);
+  const ipHash = hashIpAddress(clientIp);
+  const limitCheck = await checkAndIncrementIpRedirectLimit(link.id, ipHash, link.ipRedirectLimit);
+
+  if (!limitCheck.allowed) {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    return res.status(429).send(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Visit Limit Reached</title>
+        </head>
+        <body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif; text-align:center; padding:60px 20px; color:#333; background:#f9fafb;">
+          <div style="max-width:400px; margin:0 auto; background:#fff; padding:32px; border-radius:12px; border:1px solid #e5e7eb; box-shadow:0 1px 3px rgba(0,0,0,0.05);">
+            <h2 style="margin-top:0; font-size:20px; font-weight:700;">Visit limit reached</h2>
+            <p style="color:#6b7280; font-size:14px; margin-bottom:0;">Please try again later.</p>
+          </div>
+        </body>
+      </html>
+    `);
   }
 
   // Normal Human Visitor: Increment analytics asynchronously & Fast Server Redirect
@@ -205,7 +260,7 @@ app.post('/api-logout', (req, res) => {
 // 3. PROTECTED API ENDPOINTS (REQUIRE AUTHENTICATION)
 app.post('/api-create-link', requireAuth, upload.single('image'), async (req, res) => {
   try {
-    const { title, description, destinationUrl } = req.body;
+    const { title, description, destinationUrl, ipRedirectLimit } = req.body;
     if (!destinationUrl) {
       return res.status(400).json({ error: 'Please enter a valid destination URL.' });
     }
@@ -221,7 +276,8 @@ app.post('/api-create-link', requireAuth, upload.single('image'), async (req, re
       mimeType: req.file.mimetype || 'image/jpeg',
       destinationUrl,
       title,
-      description
+      description,
+      ipRedirectLimit: ipRedirectLimit !== undefined ? parseInt(ipRedirectLimit, 10) : 2
     });
 
     return res.status(201).json(createdLink);
@@ -257,7 +313,7 @@ app.delete('/api-user-links', requireAuth, async (req, res) => {
 
 app.post('/api-update-link', requireAuth, upload.single('image'), async (req, res) => {
   try {
-    const { linkId, title, description, destinationUrl } = req.body;
+    const { linkId, title, description, destinationUrl, ipRedirectLimit } = req.body;
     if (!linkId) {
       return res.status(400).json({ error: 'Missing link ID.' });
     }
@@ -267,6 +323,7 @@ app.post('/api-update-link', requireAuth, upload.single('image'), async (req, re
       title: title || undefined,
       description: description || undefined,
       destinationUrl: destinationUrl || undefined,
+      ipRedirectLimit: ipRedirectLimit !== undefined ? parseInt(ipRedirectLimit, 10) : undefined,
       newImageBuffer: req.file?.buffer,
       newImageFileName: req.file?.originalname,
       newMimeType: req.file?.mimetype,
@@ -294,6 +351,7 @@ app.get('/api-analytics', requireAuth, async (req, res) => {
       linkId: link.id,
       slug: link.slug,
       totalClicks: Number(link.totalClicks),
+      ipRedirectLimit: link.ipRedirectLimit,
       countries: countries.map(c => ({
         countryCode: c.countryCode,
         countryName: c.countryName,
@@ -332,15 +390,23 @@ app.get('/', requireAuth, (req, res) => {
       </div>
 
       <script>
+        let allLinks = [];
+
         async function logout() {
           await fetch('/api-logout', { method: 'POST' });
           window.location.href = '/login';
+        }
+
+        function formatLimitLabel(limit) {
+          if (limit === 0) return 'Unlimited';
+          return limit + ' / 24 hours';
         }
 
         async function loadLinks() {
           const res = await fetch('/api-user-links');
           if (res.status === 401) { window.location.href = '/login'; return; }
           const links = await res.json();
+          allLinks = links;
           const content = document.getElementById('content');
           if (!links.length) {
             content.innerHTML = '<div class="border rounded-xl p-10 text-center space-y-3 bg-white"><p class="text-slate-500 text-sm">No image links created yet.</p><button onclick="showCreate()" class="px-4 py-2 bg-blue-600 text-white text-sm font-semibold rounded-md">Create Link</button></div>';
@@ -353,10 +419,15 @@ app.get('/', requireAuth, (req, res) => {
                 <div>
                   <h3 class="font-bold text-base">\${l.title || 'Simple Image Link'}</h3>
                   <p class="text-xs font-mono text-blue-600">\${location.origin}/i/\${l.slug}</p>
-                  <p class="text-xs text-slate-500 mt-1">Clicks: <strong>\${l.totalClicks}</strong></p>
+                  <div class="flex items-center gap-3 text-xs text-slate-500 mt-1">
+                    <span>Clicks: <strong>\${l.totalClicks}</strong></span>
+                    <span>•</span>
+                    <span>IP Limit: <strong>\${formatLimitLabel(l.ipRedirectLimit)}</strong></span>
+                  </div>
                 </div>
               </div>
               <div class="flex items-center gap-2 self-end sm:self-center">
+                <button onclick="showEdit('\${l.id}')" class="px-2.5 py-1 text-xs font-semibold border rounded hover:bg-slate-100">Edit</button>
                 <button onclick="copyLink('\${l.slug}')" class="px-2.5 py-1 text-xs font-semibold border rounded hover:bg-slate-100">Copy</button>
                 <button onclick="loadAnalytics('\${l.id}')" class="px-2.5 py-1 text-xs font-semibold border rounded hover:bg-slate-100">Analytics</button>
                 <button onclick="deleteLink('\${l.id}')" class="px-2.5 py-1 text-xs font-semibold text-red-600 border border-red-200 rounded hover:bg-red-50">Delete</button>
@@ -386,7 +457,18 @@ app.get('/', requireAuth, (req, res) => {
                   <label class="block text-sm font-medium mb-1">Destination URL *</label>
                   <input type="url" id="destinationUrl" required class="w-full px-3 py-2 border rounded-md text-sm" placeholder="https://example.com" />
                 </div>
-                <div class="flex gap-2">
+                <div>
+                  <label class="block text-sm font-medium mb-1">Maximum redirects per IP</label>
+                  <select id="ipRedirectLimit" class="w-full px-3 py-2 border rounded-md text-sm bg-white">
+                    <option value="1">1 / 24 hours</option>
+                    <option value="2" selected>2 / 24 hours (Default)</option>
+                    <option value="3">3 / 24 hours</option>
+                    <option value="5">5 / 24 hours</option>
+                    <option value="10">10 / 24 hours</option>
+                    <option value="0">Unlimited</option>
+                  </select>
+                </div>
+                <div class="flex gap-2 pt-2">
                   <button type="button" onclick="loadLinks()" class="w-1/2 py-2 border text-sm font-semibold rounded-md">Cancel</button>
                   <button type="submit" class="w-1/2 py-2 bg-blue-600 text-white text-sm font-semibold rounded-md">Create Link</button>
                 </div>
@@ -402,6 +484,7 @@ app.get('/', requireAuth, (req, res) => {
           formData.append('destinationUrl', document.getElementById('destinationUrl').value);
           formData.append('title', document.getElementById('title').value);
           formData.append('description', document.getElementById('description').value);
+          formData.append('ipRedirectLimit', document.getElementById('ipRedirectLimit').value);
 
           const res = await fetch('/api-create-link', { method: 'POST', body: formData });
           if (res.ok) {
@@ -409,6 +492,75 @@ app.get('/', requireAuth, (req, res) => {
           } else {
             const err = await res.json();
             alert(err.error || 'Error creating link');
+          }
+        }
+
+        function showEdit(linkId) {
+          const link = allLinks.find(l => l.id === linkId);
+          if (!link) return;
+
+          document.getElementById('content').innerHTML = \`
+            <div class="border rounded-xl p-6 bg-white shadow-sm max-w-xl mx-auto space-y-4">
+              <h2 class="text-xl font-bold">Edit Image Link</h2>
+              <form id="editForm" onsubmit="submitEdit(event, '\${link.id}')" class="space-y-4">
+                <div class="flex items-center gap-4 border p-3 rounded-lg bg-slate-50">
+                  <img src="\${link.imageUrl}" class="w-16 h-16 object-cover rounded-md border" />
+                  <div>
+                    <label class="block text-xs font-medium text-slate-500 mb-1">Replace Image (Optional)</label>
+                    <input type="file" id="newImage" accept="image/*" class="block w-full text-xs text-slate-500" />
+                  </div>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium mb-1">Title</label>
+                  <input type="text" id="editTitle" class="w-full px-3 py-2 border rounded-md text-sm" value="\${(link.title || '').replace(/"/g, '&quot;')}" placeholder="Optional title" />
+                </div>
+                <div>
+                  <label class="block text-sm font-medium mb-1">Description</label>
+                  <textarea id="editDescription" rows="2" class="w-full px-3 py-2 border rounded-md text-sm" placeholder="Optional description">\${link.description || ''}</textarea>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium mb-1">Destination URL *</label>
+                  <input type="url" id="editDestinationUrl" required class="w-full px-3 py-2 border rounded-md text-sm" value="\${link.destinationUrl}" placeholder="https://example.com" />
+                </div>
+                <div>
+                  <label class="block text-sm font-medium mb-1">Maximum redirects per IP</label>
+                  <select id="editIpRedirectLimit" class="w-full px-3 py-2 border rounded-md text-sm bg-white">
+                    <option value="1" \${link.ipRedirectLimit === 1 ? 'selected' : ''}>1 / 24 hours</option>
+                    <option value="2" \${link.ipRedirectLimit === 2 ? 'selected' : ''}>2 / 24 hours</option>
+                    <option value="3" \${link.ipRedirectLimit === 3 ? 'selected' : ''}>3 / 24 hours</option>
+                    <option value="5" \${link.ipRedirectLimit === 5 ? 'selected' : ''}>5 / 24 hours</option>
+                    <option value="10" \${link.ipRedirectLimit === 10 ? 'selected' : ''}>10 / 24 hours</option>
+                    <option value="0" \${link.ipRedirectLimit === 0 ? 'selected' : ''}>Unlimited</option>
+                  </select>
+                </div>
+                <div class="flex gap-2 pt-2">
+                  <button type="button" onclick="loadLinks()" class="w-1/2 py-2 border text-sm font-semibold rounded-md">Cancel</button>
+                  <button type="submit" class="w-1/2 py-2 bg-blue-600 text-white text-sm font-semibold rounded-md">Save Changes</button>
+                </div>
+              </form>
+            </div>
+          \`;
+        }
+
+        async function submitEdit(e, linkId) {
+          e.preventDefault();
+          const formData = new FormData();
+          formData.append('linkId', linkId);
+          const fileInput = document.getElementById('newImage');
+          if (fileInput.files.length > 0) {
+            formData.append('image', fileInput.files[0]);
+          }
+          formData.append('title', document.getElementById('editTitle').value);
+          formData.append('description', document.getElementById('editDescription').value);
+          formData.append('destinationUrl', document.getElementById('editDestinationUrl').value);
+          formData.append('ipRedirectLimit', document.getElementById('editIpRedirectLimit').value);
+
+          const res = await fetch('/api-update-link', { method: 'POST', body: formData });
+          if (res.ok) {
+            loadLinks();
+          } else {
+            const err = await res.json();
+            alert(err.error || 'Error updating link');
           }
         }
 
@@ -421,9 +573,15 @@ app.get('/', requireAuth, (req, res) => {
                 <h2 class="text-2xl font-bold">Analytics</h2>
                 <button onclick="loadLinks()" class="px-3 py-1.5 text-xs font-semibold border rounded-md">Back to Dashboard</button>
               </div>
-              <div class="border rounded-xl p-6 bg-white shadow-sm max-w-sm">
-                <span class="text-xs font-semibold text-slate-400 uppercase">Total Clicks</span>
-                <div class="text-4xl font-extrabold mt-1">\${data.totalClicks}</div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="border rounded-xl p-6 bg-white shadow-sm">
+                  <span class="text-xs font-semibold text-slate-400 uppercase">Total Clicks</span>
+                  <div class="text-4xl font-extrabold mt-1">\${data.totalClicks}</div>
+                </div>
+                <div class="border rounded-xl p-6 bg-white shadow-sm">
+                  <span class="text-xs font-semibold text-slate-400 uppercase">IP Redirect Limit</span>
+                  <div class="text-2xl font-bold mt-2">\${formatLimitLabel(data.ipRedirectLimit)}</div>
+                </div>
               </div>
               <div class="border rounded-xl p-6 bg-white shadow-sm space-y-4">
                 <h3 class="text-lg font-bold">Clicks by Country</h3>
@@ -462,4 +620,5 @@ app.listen(PORT, () => {
 });
 
 export default app;
+
 
