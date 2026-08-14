@@ -51,3 +51,13 @@ export function validateDescription(description?: string): boolean {
   if (!description) return true;
   return description.length <= 500;
 }
+
+export const ALLOWED_IP_REDIRECT_LIMITS = [0, 1, 2, 3, 5, 10];
+
+export function validateIpRedirectLimit(limit: any): boolean {
+  if (typeof limit === 'string') {
+    limit = parseInt(limit, 10);
+  }
+  return Number.isInteger(limit) && ALLOWED_IP_REDIRECT_LIMITS.includes(limit);
+}
+
